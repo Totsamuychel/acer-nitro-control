@@ -31,7 +31,7 @@
 ## 📦 Быстрая установка
 
 ```bash
-git clone https://github.com/ВАШ_НИКНЕЙМ/acer-nitro-control.git
+git clone https://github.com/Totsamuychel/acer-nitro-control.git
 cd acer-nitro-control
 sudo ./install.sh
 ```
