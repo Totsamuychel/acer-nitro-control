@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Acer Nitro Control
+Comment=Управление кулерами и мониторинг температур Acer Nitro
+Exec=/home/Danya/.local/bin/nitro-control
+Icon=utilities-system-monitor
+Terminal=false
+Type=Application
+Categories=System;Monitor;Settings;
+Keywords=acer;nitro;fan;cooler;temperature;

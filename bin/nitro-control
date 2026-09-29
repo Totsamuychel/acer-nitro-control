@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""
+Acer Nitro Control Center (GTK4 / Libadwaita)
+Multi-tab system monitor and thermal controller for Acer Nitro AN515-45.
+Tabs:
+ 1. Охлаждение (Fans, Mode Buttons & Dedicated Manual Switch with Slider Locks)
+ 2. Память ОЗУ (RAM, ZRAM & Top RAM processes)
+ 3. Нагрузка (CPU load, Top CPU processes & GPU allocation)
+"""
+
+import glob
+import os
+import subprocess
+import sys
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib
+
+OVERRIDE_FILE = "/tmp/nitro-fan-override"
+
+def find_ec_hwmon():
+    for path in glob.glob("/sys/class/hwmon/hwmon*"):
+        name_path = os.path.join(path, "name")
+        if os.path.exists(name_path):
+            try:
+                with open(name_path, "r") as f:
+                    if f.read().strip() == "acer_nitro_ec":
+                        return path
+            except Exception:
+                pass
+    return None
+
+def read_val(path, default=0):
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return default
+
+def write_val(path, val):
+    try:
+        with open(path, "w") as f:
+            f.write(str(val))
+    except Exception:
+        pass
+
+def get_top_ram_processes(count=8):
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid,comm,%mem,rss", "--sort=-rss"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        lines = res.stdout.strip().splitlines()[1:count+1]
+        procs = []
+        for line in lines:
+            parts = line.split(None, 3)
+            if len(parts) == 4:
+                pid, comm, pmem, rss = parts
+                mb = int(rss) / 1024
+                procs.append((pid, comm, pmem, f"{mb:.1f} МБ"))
+        return procs
+    except Exception:
+        return []
+
+def get_top_cpu_processes(count=8):
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid,comm,%cpu", "--sort=-%cpu"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        lines = res.stdout.strip().splitlines()[1:count+1]
+        procs = []
+        for line in lines:
+            parts = line.split(None, 2)
+            if len(parts) == 3:
+                pid, comm, pcpu = parts
+                procs.append((pid, comm, f"{pcpu}%"))
+        return procs
+    except Exception:
+        return []
+
+def get_nvidia_processes():
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=1
+        )
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+        apps = []
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                apps.append((parts[0], os.path.basename(parts[1]), f"{parts[2]} МБ"))
+        return apps
+    except Exception:
+        return []
+
+class NitroControlWindow(Adw.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_title("Acer Nitro Control Center")
+        self.set_default_size(580, 770)
+
+        self.updating_programmatically = False
+        self.current_user_mode = "smart"  # 'auto', 'smart', 'turbo', 'manual'
+
+        # Force Dark Mode
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+
+        self.hwmon = find_ec_hwmon()
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+
+        # Tabs stack
+        self.stack = Adw.ViewStack()
+
+        # Switcher in Header
+        switcher = Adw.ViewSwitcher()
+        switcher.set_stack(self.stack)
+        header.set_title_widget(switcher)
+        toolbar.add_top_bar(header)
+
+        # ----------------------------------------------------
+        # Tab 1: Fans & Cooling
+        # ----------------------------------------------------
+        self.tab_fans = self.create_fans_tab()
+        self.stack.add_titled_with_icon(self.tab_fans, "fans", "Охлаждение", "utilities-system-monitor-symbolic")
+
+        # ----------------------------------------------------
+        # Tab 2: RAM & Memory
+        # ----------------------------------------------------
+        self.tab_ram = self.create_ram_tab()
+        self.stack.add_titled_with_icon(self.tab_ram, "ram", "ОЗУ", "drive-harddisk-symbolic")
+
+        # ----------------------------------------------------
+        # Tab 3: CPU & GPU Load
+        # ----------------------------------------------------
+        self.tab_load = self.create_load_tab()
+        self.stack.add_titled_with_icon(self.tab_load, "load", "Нагрузка", "speedometer-symbolic")
+
+        toolbar.set_content(self.stack)
+        self.set_content(toolbar)
+
+        # Initialize manual toggle state from override file
+        if os.path.exists(OVERRIDE_FILE):
+            try:
+                with open(OVERRIDE_FILE, "r") as f:
+                    ov = f.read().strip().lower()
+                if ov.startswith("manual:"):
+                    self.manual_switch.set_active(True)
+                elif ov == "turbo":
+                    self.current_user_mode = "turbo"
+                elif ov == "auto":
+                    self.current_user_mode = "auto"
+            except Exception:
+                pass
+
+        # Timer for real-time updates (1 second)
+        self.update_all()
+        GLib.timeout_add_seconds(1, self.update_all)
+
+    # ------------------------------------------------------------------
+    # TAB 1: Fans UI with Manual Control Toggle
+    # ------------------------------------------------------------------
+    def create_fans_tab(self):
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_hexpand(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        box.set_margin_top(16)
+        box.set_margin_bottom(20)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+
+        clamp = Adw.Clamp(maximum_size=600)
+        clamp.set_child(box)
+        scroller.set_child(clamp)
+
+        # Group 1: Gauges & Temperatures
+        fan_group = Adw.PreferencesGroup(title="Датчики кулеров и температуры")
+        box.append(fan_group)
+
+        self.cpu_fan_row = Adw.ActionRow(title="Кулер процессора (CPU)", subtitle="Опрос...")
+        self.cpu_fan_bar = Gtk.ProgressBar()
+        self.cpu_fan_bar.set_valign(Gtk.Align.CENTER)
+        self.cpu_fan_bar.set_size_request(130, -1)
+        self.cpu_temp_label = Gtk.Label(label="-- °C")
+        self.cpu_temp_label.add_css_class("title-3")
+        self.cpu_fan_row.add_suffix(self.cpu_temp_label)
+        self.cpu_fan_row.add_suffix(self.cpu_fan_bar)
+        fan_group.add(self.cpu_fan_row)
+
+        self.gpu_fan_row = Adw.ActionRow(title="Кулер видеокарты (GPU)", subtitle="Опрос...")
+        self.gpu_fan_bar = Gtk.ProgressBar()
+        self.gpu_fan_bar.set_valign(Gtk.Align.CENTER)
+        self.gpu_fan_bar.set_size_request(130, -1)
+        self.gpu_temp_label = Gtk.Label(label="-- °C")
+        self.gpu_temp_label.add_css_class("title-3")
+        self.gpu_fan_row.add_suffix(self.gpu_temp_label)
+        self.gpu_fan_row.add_suffix(self.gpu_fan_bar)
+        fan_group.add(self.gpu_fan_row)
+
+        self.sys_temp_row = Adw.ActionRow(title="Материнская плата (EC)", subtitle="Температура корпуса")
+        self.sys_temp_label = Gtk.Label(label="-- °C")
+        self.sys_temp_label.add_css_class("title-4")
+        self.sys_temp_row.add_suffix(self.sys_temp_label)
+        fan_group.add(self.sys_temp_row)
+
+        # Group 2: Modes & Manual Control
+        ctrl_group = Adw.PreferencesGroup(title="Управление режимами охлаждения")
+        box.append(ctrl_group)
+
+        # Manual Toggle Switch
+        self.manual_switch = Adw.SwitchRow(
+            title="Ручное управление оборотами",
+            subtitle="Отключает автоматические кнопки и передает контроль ползункам"
+        )
+        self.manual_switch.connect("notify::active", self.on_manual_toggle)
+        ctrl_group.add(self.manual_switch)
+
+        # Mode Buttons Box
+        self.btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.btn_box.set_homogeneous(True)
+        self.btn_box.set_margin_top(8)
+        self.btn_box.set_margin_bottom(10)
+
+        self.btn_auto = Gtk.Button(label="Заводской (Тихий)")
+        self.btn_auto.connect("clicked", self.on_mode_auto)
+        self.btn_box.append(self.btn_auto)
+
+        self.btn_smart = Gtk.Button(label="Умный Автофан")
+        self.btn_smart.add_css_class("suggested-action")
+        self.btn_smart.connect("clicked", self.on_mode_smart)
+        self.btn_box.append(self.btn_smart)
+
+        self.btn_turbo = Gtk.Button(label="ТУРБО (100%)")
+        self.btn_turbo.add_css_class("destructive-action")
+        self.btn_turbo.connect("clicked", self.on_mode_turbo)
+        self.btn_box.append(self.btn_turbo)
+        ctrl_group.add(self.btn_box)
+
+        # Sliders with Percentage Display
+        self.slider_row_cpu = Adw.ActionRow(title="Скорость обдува CPU")
+        self.scale_cpu = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 20, 100, 1)
+        self.scale_cpu.set_value(50)
+        self.scale_cpu.set_size_request(150, -1)
+        self.scale_cpu.set_sensitive(False)  # Disabled until manual switch is ON
+        self.scale_cpu.connect("value-changed", self.on_manual_change)
+
+        self.cpu_pct_label = Gtk.Label(label="50%")
+        self.cpu_pct_label.set_size_request(55, -1)
+        self.cpu_pct_label.add_css_class("title-4")
+
+        self.slider_row_cpu.add_suffix(self.scale_cpu)
+        self.slider_row_cpu.add_suffix(self.cpu_pct_label)
+        ctrl_group.add(self.slider_row_cpu)
+
+        self.slider_row_gpu = Adw.ActionRow(title="Скорость обдува GPU")
+        self.scale_gpu = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 20, 100, 1)
+        self.scale_gpu.set_value(50)
+        self.scale_gpu.set_size_request(150, -1)
+        self.scale_gpu.set_sensitive(False)  # Disabled until manual switch is ON
+        self.scale_gpu.connect("value-changed", self.on_manual_change)
+
+        self.gpu_pct_label = Gtk.Label(label="50%")
+        self.gpu_pct_label.set_size_request(55, -1)
+        self.gpu_pct_label.add_css_class("title-4")
+
+        self.slider_row_gpu.add_suffix(self.scale_gpu)
+        self.slider_row_gpu.add_suffix(self.gpu_pct_label)
+        ctrl_group.add(self.slider_row_gpu)
+
+        self.fan_status_label = Gtk.Label(label="Текущий режим: Умный Автофан активен")
+        self.fan_status_label.add_css_class("dim-label")
+        box.append(self.fan_status_label)
+
+        return scroller
+
+    # ------------------------------------------------------------------
+    # TAB 2: RAM & Memory UI
+    # ------------------------------------------------------------------
+    def create_ram_tab(self):
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_hexpand(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        box.set_margin_top(16)
+        box.set_margin_bottom(20)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+
+        clamp = Adw.Clamp(maximum_size=600)
+        clamp.set_child(box)
+        scroller.set_child(clamp)
+
+        overview_group = Adw.PreferencesGroup(title="Состояние оперативной памяти")
+        box.append(overview_group)
+
+        self.ram_summary_row = Adw.ActionRow(
+            title="Физическая память: 16 ГБ",
+            subtitle="Доступно ОС: 15.3 ГБ (~700 МБ аппаратно зарезервировано под AMD Radeon VRAM и UEFI)"
+        )
+        overview_group.add(self.ram_summary_row)
+
+        self.ram_usage_row = Adw.ActionRow(title="Занято ОЗУ", subtitle="0 ГБ / 0 ГБ")
+        self.ram_bar = Gtk.ProgressBar()
+        self.ram_bar.set_valign(Gtk.Align.CENTER)
+        self.ram_bar.set_size_request(140, -1)
+        self.ram_usage_row.add_suffix(self.ram_bar)
+        overview_group.add(self.ram_usage_row)
+
+        self.zram_row = Adw.ActionRow(title="ZRAM (Сжатый Swap в RAM)", subtitle="0 ГБ из 7.5 ГБ")
+        self.zram_bar = Gtk.ProgressBar()
+        self.zram_bar.set_valign(Gtk.Align.CENTER)
+        self.zram_bar.set_size_request(140, -1)
+        self.zram_row.add_suffix(self.zram_bar)
+        overview_group.add(self.zram_row)
+
+        self.top_ram_group = Adw.PreferencesGroup(title="Программы, потребляющие больше всего ОЗУ")
+        box.append(self.top_ram_group)
+
+        self.ram_proc_rows = []
+        for _ in range(8):
+            row = Adw.ActionRow(title="--", subtitle="--")
+            lbl = Gtk.Label(label="--")
+            lbl.add_css_class("numeric")
+            row.add_suffix(lbl)
+            self.top_ram_group.add(row)
+            self.ram_proc_rows.append((row, lbl))
+
+        return scroller
+
+    # ------------------------------------------------------------------
+    # TAB 3: CPU & GPU Load UI
+    # ------------------------------------------------------------------
+    def create_load_tab(self):
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_hexpand(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        box.set_margin_top(16)
+        box.set_margin_bottom(20)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+
+        clamp = Adw.Clamp(maximum_size=600)
+        clamp.set_child(box)
+        scroller.set_child(clamp)
+
+        gpu_group = Adw.PreferencesGroup(title="Видеокарты и распределение нагрузки")
+        box.append(gpu_group)
+
+        self.igpu_row = Adw.ActionRow(
+            title="AMD Radeon Vega (Встроенная iGPU)",
+            subtitle="Рендерит рабочий стол Hyprland, интерфейс и экран 144 Гц"
+        )
+        gpu_group.add(self.igpu_row)
+
+        self.dgpu_row = Adw.ActionRow(
+            title="NVIDIA GeForce RTX 3060 (Дискретная dGPU)",
+            subtitle="Проверка статуса..."
+        )
+        gpu_group.add(self.dgpu_row)
+
+        self.dgpu_apps_row = Adw.ActionRow(
+            title="Программы на видеокарте NVIDIA",
+            subtitle="Нет запущенных 3D-процессов (карта спит)"
+        )
+        gpu_group.add(self.dgpu_apps_row)
+
+        self.top_cpu_group = Adw.PreferencesGroup(title="Программы, грузящие процессор (CPU)")
+        box.append(self.top_cpu_group)
+
+        self.cpu_proc_rows = []
+        for _ in range(8):
+            row = Adw.ActionRow(title="--", subtitle="--")
+            lbl = Gtk.Label(label="--")
+            lbl.add_css_class("numeric")
+            row.add_suffix(lbl)
+            self.top_cpu_group.add(row)
+            self.cpu_proc_rows.append((row, lbl))
+
+        return scroller
+
+    # ------------------------------------------------------------------
+    # Control Callbacks & Logic
+    # ------------------------------------------------------------------
+    def on_manual_toggle(self, switch, gparam):
+        is_manual = self.manual_switch.get_active()
+
+        # Disable/Enable buttons and sliders
+        self.btn_box.set_sensitive(not is_manual)
+        self.scale_cpu.set_sensitive(is_manual)
+        self.scale_gpu.set_sensitive(is_manual)
+
+        if is_manual:
+            self.current_user_mode = "manual"
+            self.apply_manual_speed()
+        else:
+            # Switch back to Smart Auto mode by default
+            self.on_mode_smart(None)
+
+    def on_mode_turbo(self, btn):
+        if self.manual_switch.get_active():
+            return
+        self.current_user_mode = "turbo"
+        if self.hwmon:
+            write_val(os.path.join(self.hwmon, "pwm1_enable"), 0)
+            write_val(os.path.join(self.hwmon, "pwm2_enable"), 0)
+        try:
+            with open(OVERRIDE_FILE, "w") as f:
+                f.write("turbo")
+            self.fan_status_label.set_text("Текущий режим: ТУРБО (Максимальные обороты 100%)")
+        except Exception as e:
+            self.fan_status_label.set_text(f"Ошибка: {e}")
+
+        # Synchronize Sliders & Labels to 100%
+        self.set_sliders_display(100, 100)
+
+    def on_mode_smart(self, btn):
+        if self.manual_switch.get_active():
+            return
+        self.current_user_mode = "smart"
+        if self.hwmon:
+            write_val(os.path.join(self.hwmon, "pwm1_enable"), 2)
+            write_val(os.path.join(self.hwmon, "pwm2_enable"), 2)
+        try:
+            if os.path.exists(OVERRIDE_FILE):
+                os.remove(OVERRIDE_FILE)
+            self.fan_status_label.set_text("Текущий режим: Умный Автофан активен (динамическое охлаждение)")
+        except Exception as e:
+            self.fan_status_label.set_text(f"Ошибка: {e}")
+
+        self.sync_sliders_from_hw()
+
+    def on_mode_auto(self, btn):
+        if self.manual_switch.get_active():
+            return
+        self.current_user_mode = "auto"
+        if self.hwmon:
+            write_val(os.path.join(self.hwmon, "pwm1_enable"), 2)
+            write_val(os.path.join(self.hwmon, "pwm2_enable"), 2)
+        try:
+            with open(OVERRIDE_FILE, "w") as f:
+                f.write("auto")
+            self.fan_status_label.set_text("Текущий режим: Заводской Автоматический (тихий)")
+        except Exception as e:
+            self.fan_status_label.set_text(f"Ошибка: {e}")
+
+        self.sync_sliders_from_hw()
+
+    def on_manual_change(self, scale):
+        if self.updating_programmatically or not self.manual_switch.get_active():
+            return
+        self.apply_manual_speed()
+
+    def apply_manual_speed(self):
+        val_cpu = int(self.scale_cpu.get_value())
+        val_gpu = int(self.scale_gpu.get_value())
+
+        # Update percentage labels next to sliders
+        self.cpu_pct_label.set_markup(f"<span weight='bold'>{val_cpu}%</span>")
+        self.gpu_pct_label.set_markup(f"<span weight='bold'>{val_gpu}%</span>")
+
+        # Hardware manual PWM values (0-255)
+        s1 = int(val_cpu * 255 / 100)
+        s2 = int(val_gpu * 255 / 100)
+        if self.hwmon:
+            write_val(os.path.join(self.hwmon, "pwm1_enable"), 1)
+            write_val(os.path.join(self.hwmon, "pwm1"), s1)
+            write_val(os.path.join(self.hwmon, "pwm2_enable"), 1)
+            write_val(os.path.join(self.hwmon, "pwm2"), s2)
+
+        try:
+            with open(OVERRIDE_FILE, "w") as f:
+                f.write(f"manual:{s1}:{s2}")
+            self.fan_status_label.set_text(f"Текущий режим: Ручной (CPU {val_cpu}%, GPU {val_gpu}%)")
+        except Exception as e:
+            self.fan_status_label.set_text(f"Ошибка: {e}")
+
+    def set_sliders_display(self, cpu_pct, gpu_pct):
+        self.updating_programmatically = True
+        self.scale_cpu.set_value(cpu_pct)
+        self.scale_gpu.set_value(gpu_pct)
+        self.cpu_pct_label.set_markup(f"<span weight='bold'>{int(cpu_pct)}%</span>")
+        self.gpu_pct_label.set_markup(f"<span weight='bold'>{int(gpu_pct)}%</span>")
+        self.updating_programmatically = False
+
+    def sync_sliders_from_hw(self):
+        if not self.hwmon:
+            return
+        pwm1 = read_val(os.path.join(self.hwmon, "pwm1"), 128)
+        pwm2 = read_val(os.path.join(self.hwmon, "pwm2"), 128)
+        c_pct = max(20, min(100, int(pwm1 * 100 / 255)))
+        g_pct = max(20, min(100, int(pwm2 * 100 / 255)))
+        self.set_sliders_display(c_pct, g_pct)
+
+    # ------------------------------------------------------------------
+    # Live Data Refresh
+    # ------------------------------------------------------------------
+    def update_all(self):
+        self.update_fans()
+        self.update_ram()
+        self.update_load()
+        return True
+
+    def update_fans(self):
+        if not self.hwmon or not os.path.exists(self.hwmon):
+            self.hwmon = find_ec_hwmon()
+            if not self.hwmon:
+                return
+
+        cpu_rpm = read_val(os.path.join(self.hwmon, "fan1_input"), 0)
+        gpu_rpm = read_val(os.path.join(self.hwmon, "fan2_input"), 0)
+
+        t_cpu = read_val(os.path.join(self.hwmon, "temp1_input"), 0) / 1000.0
+        t_gpu = read_val(os.path.join(self.hwmon, "temp2_input"), 0) / 1000.0
+        t_sys = read_val(os.path.join(self.hwmon, "temp3_input"), 0) / 1000.0
+
+        self.cpu_fan_row.set_subtitle(f"{cpu_rpm} RPM")
+        self.gpu_fan_row.set_subtitle(f"{gpu_rpm} RPM")
+
+        self.cpu_fan_bar.set_fraction(min(1.0, max(0.0, cpu_rpm / 5500.0)))
+        self.gpu_fan_bar.set_fraction(min(1.0, max(0.0, gpu_rpm / 5500.0)))
+
+        # Badges for temperature
+        if t_cpu >= 80:
+            self.cpu_temp_label.set_markup(f"<span foreground='#ff5555' weight='bold'>{int(t_cpu)} °C</span>")
+        elif t_cpu >= 68:
+            self.cpu_temp_label.set_markup(f"<span foreground='#ffaa33' weight='bold'>{int(t_cpu)} °C</span>")
+        else:
+            self.cpu_temp_label.set_markup(f"<span foreground='#55ff55' weight='bold'>{int(t_cpu)} °C</span>")
+
+        if t_gpu >= 75:
+            self.gpu_temp_label.set_markup(f"<span foreground='#ff5555' weight='bold'>{int(t_gpu)} °C</span>")
+        elif t_gpu >= 62:
+            self.gpu_temp_label.set_markup(f"<span foreground='#ffaa33' weight='bold'>{int(t_gpu)} °C</span>")
+        else:
+            self.gpu_temp_label.set_markup(f"<span foreground='#55ff55' weight='bold'>{int(t_gpu)} °C</span>")
+
+        self.sys_temp_label.set_text(f"{int(t_sys)} °C")
+
+        # Synchronize Sliders & Percentage Displays ONLY IF NOT in manual mode
+        if not self.manual_switch.get_active():
+            if self.current_user_mode == "turbo":
+                self.set_sliders_display(100, 100)
+            elif self.current_user_mode in ("smart", "auto"):
+                pwm1 = read_val(os.path.join(self.hwmon, "pwm1"), 128)
+                pwm2 = read_val(os.path.join(self.hwmon, "pwm2"), 128)
+                c_pct = max(20, min(100, int(pwm1 * 100 / 255)))
+                g_pct = max(20, min(100, int(pwm2 * 100 / 255)))
+                self.set_sliders_display(c_pct, g_pct)
+
+    def update_ram(self):
+        try:
+            with open("/proc/meminfo", "r") as f:
+                lines = f.readlines()
+            info = {}
+            for line in lines:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    info[parts[0].strip()] = int(parts[1].strip().split()[0])
+            total_kb = info.get("MemTotal", 1)
+            avail_kb = info.get("MemAvailable", 1)
+            used_kb = total_kb - avail_kb
+
+            total_gb = total_kb / 1024 / 1024
+            used_gb = used_kb / 1024 / 1024
+            pct = used_kb / total_kb
+
+            self.ram_usage_row.set_subtitle(f"Использовано: {used_gb:.1f} ГБ из {total_gb:.1f} ГБ ({int(pct*100)}%)")
+            self.ram_bar.set_fraction(min(1.0, max(0.0, pct)))
+
+            sw_total = info.get("SwapTotal", 0) / 1024 / 1024
+            sw_free = info.get("SwapFree", 0) / 1024 / 1024
+            sw_used = max(0, sw_total - sw_free)
+            sw_pct = (sw_used / sw_total) if sw_total > 0 else 0
+            self.zram_row.set_subtitle(f"Использовано: {sw_used:.1f} ГБ из {sw_total:.1f} ГБ ({int(sw_pct*100)}%)")
+            self.zram_bar.set_fraction(min(1.0, max(0.0, sw_pct)))
+        except Exception:
+            pass
+
+        # Update Top RAM processes
+        top_procs = get_top_ram_processes(len(self.ram_proc_rows))
+        for i, (row, lbl) in enumerate(self.ram_proc_rows):
+            if i < len(top_procs):
+                pid, comm, pmem, mb_str = top_procs[i]
+                row.set_title(comm)
+                row.set_subtitle(f"PID: {pid} | Доля памяти: {pmem}%")
+                lbl.set_text(mb_str)
+                row.set_visible(True)
+            else:
+                row.set_visible(False)
+
+    def update_load(self):
+        # Update NVIDIA dGPU status
+        pci_pm = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
+        if os.path.exists(pci_pm):
+            try:
+                with open(pci_pm, "r") as f:
+                    pm_stat = f.read().strip()
+                if pm_stat == "suspended":
+                    self.dgpu_row.set_subtitle("Режим сна D3cold (0 Вт, чип отключен для экономии энергии)")
+                else:
+                    self.dgpu_row.set_subtitle("Активна (Используется для 3D/вычислений)")
+            except Exception:
+                pass
+
+        nv_apps = get_nvidia_processes()
+        if nv_apps:
+            summary = ", ".join([f"{name} ({vram})" for _, name, vram in nv_apps])
+            self.dgpu_apps_row.set_subtitle(summary)
+        else:
+            self.dgpu_apps_row.set_subtitle("Нет запущенных 3D-процессов (карта спит)")
+
+        # Update Top CPU processes
+        top_cpus = get_top_cpu_processes(len(self.cpu_proc_rows))
+        for i, (row, lbl) in enumerate(self.cpu_proc_rows):
+            if i < len(top_cpus):
+                pid, comm, pcpu_str = top_cpus[i]
+                row.set_title(comm)
+                row.set_subtitle(f"PID: {pid}")
+                lbl.set_text(pcpu_str)
+                row.set_visible(True)
+            else:
+                row.set_visible(False)
+
+def main():
+    app = Adw.Application(application_id="com.acer.nitrocontrol")
+    def on_activate(application):
+        win = NitroControlWindow(application=application)
+        win.present()
+    app.connect("activate", on_activate)
+    app.run(sys.argv)
+
+if __name__ == "__main__":
+    main()
