@@ -1,7 +1,8 @@
 [Desktop Entry]
 Name=Acer Nitro Control
-Comment=Управление кулерами и мониторинг температур Acer Nitro
-Exec=/home/Danya/.local/bin/nitro-control
+Comment=Fan speed control and hardware monitoring for Acer Nitro
+Comment[ru]=Управление кулерами и мониторинг температур Acer Nitro
+Exec=nitro-control
 Icon=utilities-system-monitor
 Terminal=false
 Type=Application
